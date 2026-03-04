@@ -1,15 +1,28 @@
 [project]
-name = "LUNA-Z-Image-Qwen3-VL"
-version = "0.1.0"
+name = "luna-z-image-qwen3-vl"
 description = "ComfyUI nodes for GGUF-based Qwen3/Qwen3-VL text encoding and VLM inference for Z-Image"
+version = "0.1.0"
 readme = "README.md"
-license = {text = "MIT"}
+license = {file = "LICENSE"}
 requires-python = ">=3.9"
+classifiers = [
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+
+dependencies = ["huggingface_hub", "llama-cpp-python @ https://github.com/LSDJesus/llama-cpp-python/releases/download/v0.3.27-cuda-6396cf3/llama_cpp_python-0.3.27-cp39-abi3-win_amd64.whl ; sys_platform == \"win32\"", "llama-cpp-python @ https://github.com/LSDJesus/llama-cpp-python/releases/download/v0.3.27-cuda-6396cf3/llama_cpp_python-0.3.27-cp39-abi3-manylinux_2_28_x86_64.whl ; sys_platform == \"linux\""]
 
 [project.urls]
-Repository = "https://github.com/JamePeng/LUNA-Z-Image-Qwen3-VL"
+Repository = "https://github.com/LSDJesus/LUNA-Z-Image-Qwen3-VL"
+#  Used by Comfy Registry https://registry.comfy.org
+Documentation = "https://github.com/LSDJesus/LUNA-Z-Image-Qwen3-VL/wiki"
+"Bug Tracker" = "https://github.com/LSDJesus/LUNA-Z-Image-Qwen3-VL/issues"
 
 [tool.comfy]
-PublisherId = "luna"
+PublisherId = "lsdjesus"
 DisplayName = "LUNA Z-Image Qwen3-VL"
 Icon = ""
+includes = [] 
+# "requires-comfyui" = ">=1.0.0"  # ComfyUI version compatibility
+

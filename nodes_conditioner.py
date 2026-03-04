@@ -12,13 +12,12 @@ from __future__ import annotations
 import os
 import logging
 import ctypes
-from typing import Optional
 
 import torch
 import torch.nn as nn
 import numpy as np
 
-import folder_paths
+from .nodes_loader import _get_adapter_files, _ensure_file
 
 logger = logging.getLogger("LUNA-VLM")
 
@@ -94,22 +93,6 @@ def _load_adapter(adapter_path: str, device: torch.device) -> VLtoBaseAdapter:
     logger.info(f"Loaded adapter: {os.path.basename(adapter_path)} "
                 f"({sum(p.numel() for p in adapter.parameters()):,} params)")
     return adapter
-
-
-# ── Helper: Get adapter files ─────────────────────────────────────────────────
-
-def _get_adapter_files() -> list[str]:
-    """Scan registered folders for adapter checkpoint files."""
-    results = ["none"]
-    for key in ["luna_adapter", "clip", "text_encoders"]:
-        try:
-            for f in folder_paths.get_filename_list(key):
-                if f.endswith((".safetensors", ".pt")) and "adapter" in f.lower():
-                    if f not in results:
-                        results.append(f)
-        except Exception:
-            pass
-    return results
 
 
 # ── Node ──────────────────────────────────────────────────────────────────────
@@ -209,17 +192,7 @@ class LunaTextConditioner:
 
         # ── Apply adapter if requested ────────────────────────────────
         if adapter_path and adapter_path != "none":
-            full_adapter_path = None
-            for key in ["luna_adapter", "clip", "text_encoders"]:
-                try:
-                    full_adapter_path = folder_paths.get_full_path(key, adapter_path)
-                    if full_adapter_path and os.path.isfile(full_adapter_path):
-                        break
-                except Exception:
-                    continue
-
-            if not full_adapter_path or not os.path.isfile(full_adapter_path):
-                raise FileNotFoundError(f"Adapter not found: {adapter_path}")
+            full_adapter_path = _ensure_file(adapter_path)
 
             device = torch.device(f"cuda:{llm_model['gpu_index']}")
             adapter = _load_adapter(full_adapter_path, device)

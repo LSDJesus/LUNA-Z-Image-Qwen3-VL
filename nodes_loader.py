@@ -1,6 +1,11 @@
 """
 LunaVLMLoader — Load a GGUF model via llama-cpp-python for text encoding or VLM.
 
+All model files (GGUF, mmproj, adapter) live in a single directory:
+    models/LLM/LUNA-Qwen3-VL/
+
+Files are auto-downloaded from HuggingFace on first use if not present locally.
+
 Outputs a LLM_MODEL dict containing the loaded Llama instance and metadata,
 consumed by LunaTextConditioner and LunaVLMChat nodes.
 """
@@ -12,39 +17,108 @@ import folder_paths
 
 logger = logging.getLogger("LUNA-VLM")
 
-# Register custom folder for GGUF LLM models and mmproj files
-for key, targets in [
-    ("luna_llm_gguf", ["diffusion_models", "unet"]),
-    ("luna_mmproj", ["clip", "text_encoders"]),
-    ("luna_adapter", ["clip", "text_encoders"]),
-]:
-    base = folder_paths.folder_names_and_paths.get(key, ([], {}))
-    base_dirs = base[0] if isinstance(base[0], (list, set, tuple)) else []
-    target = next((x for x in targets if x in folder_paths.folder_names_and_paths), targets[0])
-    orig, _ = folder_paths.folder_names_and_paths.get(target, ([], {}))
-    folder_paths.folder_names_and_paths[key] = (orig or base_dirs, {".gguf"})
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+HF_REPO_ID = "LSDJesus/LUNA-Qwen3-VL"
+
+# Known model files — always shown in dropdowns, auto-downloaded on first use
+DEFAULT_MODEL = "LUNA-Qwen3-VL.i1-Q4_K_M.gguf"
+DEFAULT_MMPROJ = "LUNA-Qwen3-VL.mmproj-Q8_0.gguf"
+DEFAULT_ADAPTER = "LUNA-Qwen3-VL_adapter.safetensors"
+
+# ── Register folder path ─────────────────────────────────────────────────────
+
+_luna_model_dir = os.path.join(folder_paths.models_dir, "LLM", "LUNA-Qwen3-VL")
+os.makedirs(_luna_model_dir, exist_ok=True)
+
+folder_paths.folder_names_and_paths["luna_qwen3_vl"] = (
+    [_luna_model_dir],
+    {".gguf", ".safetensors", ".pt"},
+)
 
 
-def _get_gguf_files(key: str) -> list[str]:
-    """Get .gguf files from a registered folder path."""
+# ── HuggingFace Auto-Download ─────────────────────────────────────────────────
+
+def _ensure_file(filename: str) -> str:
+    """Return full path to filename, downloading from HuggingFace if missing."""
+    # Check primary directory first
+    full_path = os.path.join(_luna_model_dir, filename)
+    if os.path.isfile(full_path):
+        return full_path
+
+    # Check all registered paths for this key
     try:
-        return [f for f in folder_paths.get_filename_list(key) if f.endswith(".gguf")]
+        found = folder_paths.get_full_path("luna_qwen3_vl", filename)
+        if found and os.path.isfile(found):
+            return found
+    except Exception:
+        pass
+
+    # Auto-download from HuggingFace
+    logger.info(f"Downloading {filename} from {HF_REPO_ID}...")
+    try:
+        from huggingface_hub import hf_hub_download
+        downloaded = hf_hub_download(
+            repo_id=HF_REPO_ID,
+            filename=filename,
+            local_dir=_luna_model_dir,
+        )
+        logger.info(f"  Downloaded to: {downloaded}")
+        return downloaded
+    except ImportError:
+        raise RuntimeError(
+            f"'{filename}' not found in {_luna_model_dir} and "
+            f"huggingface_hub is not installed for auto-download.\n"
+            f"Install with: pip install huggingface_hub\n"
+            f"Or manually download from: https://huggingface.co/{HF_REPO_ID}"
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to download '{filename}' from {HF_REPO_ID}: {e}\n"
+            f"Please download manually to: {_luna_model_dir}"
+        )
+
+
+# ── File Discovery ────────────────────────────────────────────────────────────
+
+def _get_luna_files(ext_filter: set[str] | None = None) -> list[str]:
+    """List files in the LUNA model directory, optionally filtered by extension."""
+    try:
+        files = folder_paths.get_filename_list("luna_qwen3_vl")
+        if ext_filter:
+            files = [f for f in files if any(f.endswith(e) for e in ext_filter)]
+        return sorted(set(files))
     except Exception:
         return []
 
 
+def _get_gguf_models() -> list[str]:
+    """Get GGUF model files (excluding mmproj)."""
+    found = [f for f in _get_luna_files({".gguf"}) if "mmproj" not in f.lower()]
+    if DEFAULT_MODEL not in found:
+        found.insert(0, DEFAULT_MODEL)
+    return found
+
+
+def _get_mmproj_files() -> list[str]:
+    """Get mmproj GGUF files."""
+    found = [f for f in _get_luna_files({".gguf"}) if "mmproj" in f.lower()]
+    result = ["none"]
+    if DEFAULT_MMPROJ not in found:
+        result.append(DEFAULT_MMPROJ)
+    result.extend(found)
+    return result
+
+
 def _get_adapter_files() -> list[str]:
-    """Get adapter files (.safetensors / .pt) from adapter folder paths."""
-    results = ["none"]
-    for key in ["luna_adapter", "clip", "text_encoders"]:
-        try:
-            for f in folder_paths.get_filename_list(key):
-                if f.endswith((".safetensors", ".pt")) and "adapter" in f.lower():
-                    if f not in results:
-                        results.append(f)
-        except Exception:
-            pass
-    return results
+    """Get adapter checkpoint files (.safetensors / .pt)."""
+    found = [f for f in _get_luna_files({".safetensors", ".pt"})
+             if "adapter" in f.lower()]
+    result = ["none"]
+    if DEFAULT_ADAPTER not in found:
+        result.append(DEFAULT_ADAPTER)
+    result.extend(found)
+    return result
 
 
 class LunaVLMLoader:
@@ -57,20 +131,10 @@ class LunaVLMLoader:
 
     @classmethod
     def INPUT_TYPES(cls):
-        gguf_files = _get_gguf_files("luna_llm_gguf")
-        if not gguf_files:
-            # Fallback: scan all registered GGUF paths
-            gguf_files = _get_gguf_files("clip_gguf") + _get_gguf_files("unet_gguf")
-        gguf_files = sorted(set(gguf_files)) or ["(no .gguf files found)"]
-
-        mmproj_files = ["none"] + sorted(set(
-            f for f in _get_gguf_files("luna_mmproj")
-            if "mmproj" in f.lower()
-        ))
-
         return {
             "required": {
-                "model_path": (gguf_files, {"tooltip": "GGUF model file (e.g. Qwen3-4B.i1-Q4_K_M.gguf)"}),
+                "model_path": (_get_gguf_models(),
+                               {"tooltip": "GGUF model file — auto-downloaded from HuggingFace if missing"}),
                 "gpu_index": ("INT", {"default": 0, "min": 0, "max": 7, "step": 1,
                                       "tooltip": "CUDA device index for the LLM"}),
                 "n_ctx": ("INT", {"default": 2048, "min": 512, "max": 32768, "step": 256,
@@ -79,7 +143,8 @@ class LunaVLMLoader:
                                          "tooltip": "-1 = offload all layers to GPU"}),
             },
             "optional": {
-                "mmproj_path": (mmproj_files, {"tooltip": "Optional mmproj file for vision (VLM Chat only)"}),
+                "mmproj_path": (_get_mmproj_files(),
+                                {"tooltip": "mmproj file for vision (VLM Chat). Auto-downloaded if missing."}),
             },
         }
 
@@ -98,31 +163,16 @@ class LunaVLMLoader:
         except ImportError:
             raise RuntimeError(
                 "llama-cpp-python is not installed. Install the LUNA fork with "
-                "penultimate layer support: pip install llama-cpp-python from "
-                "https://github.com/JamePeng/llama-cpp-python"
+                "penultimate layer support from: "
+                "https://github.com/LSDJesus/llama-cpp-python"
             )
 
-        # Resolve full paths
-        full_model_path = folder_paths.get_full_path("luna_llm_gguf", model_path)
-        if full_model_path is None:
-            # Try other registered paths
-            for key in ["clip", "clip_gguf", "unet_gguf", "diffusion_models"]:
-                full_model_path = folder_paths.get_full_path(key, model_path)
-                if full_model_path:
-                    break
-        if not full_model_path or not os.path.isfile(full_model_path):
-            raise FileNotFoundError(f"GGUF model not found: {model_path}")
+        # Resolve full paths (auto-downloads from HuggingFace if missing)
+        full_model_path = _ensure_file(model_path)
 
         full_mmproj_path = None
         if mmproj_path and mmproj_path != "none":
-            full_mmproj_path = folder_paths.get_full_path("luna_mmproj", mmproj_path)
-            if full_mmproj_path is None:
-                for key in ["clip", "clip_gguf", "text_encoders"]:
-                    full_mmproj_path = folder_paths.get_full_path(key, mmproj_path)
-                    if full_mmproj_path:
-                        break
-            if not full_mmproj_path or not os.path.isfile(full_mmproj_path):
-                raise FileNotFoundError(f"mmproj file not found: {mmproj_path}")
+            full_mmproj_path = _ensure_file(mmproj_path)
 
         logger.info(f"Loading GGUF model: {model_path} on cuda:{gpu_index}")
         if full_mmproj_path:

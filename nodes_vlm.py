@@ -12,11 +12,8 @@ from __future__ import annotations
 
 import io
 import os
-import sys
 import ctypes
 import logging
-import tempfile
-from typing import Optional
 
 import numpy as np
 import torch
