@@ -1,0 +1,15 @@
+[project]
+name = "LUNA-Z-Image-Qwen3-VL"
+version = "0.1.0"
+description = "ComfyUI nodes for GGUF-based Qwen3/Qwen3-VL text encoding and VLM inference for Z-Image"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+
+[project.urls]
+Repository = "https://github.com/JamePeng/LUNA-Z-Image-Qwen3-VL"
+
+[tool.comfy]
+PublisherId = "luna"
+DisplayName = "LUNA Z-Image Qwen3-VL"
+Icon = ""
