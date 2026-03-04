@@ -1,85 +1,96 @@
 # LUNA Z-Image Qwen3-VL
 
-ComfyUI custom nodes for using **GGUF quantized Qwen3 / Qwen3-VL** models as text encoders for Z-Image, and for vision-language (VLM) inference.
+ComfyUI custom nodes for using **GGUF quantized Qwen3-VL** as a text encoder for [Z-Image](https://github.com/city96/ComfyUI-GGUF), with built-in vision-language (VLM) chat for image-to-prompt generation.
 
-## What This Does
+**Models are auto-downloaded from [HuggingFace](https://huggingface.co/LSDJesus/LUNA-Qwen3-VL) on first use.**
 
-- **LUNA VLM Loader** — Load a GGUF model (+ optional mmproj for vision) via llama-cpp-python
-- **LUNA Text Conditioner** — Extract penultimate hidden states (`hidden_states[-2]`) from the GGUF model for Z-Image conditioning, with optional adapter alignment for non-base model variants
-- **LUNA VLM Chat** — Feed an image to the VLM, get descriptive text back for prompt engineering
+## Nodes
 
-### Why Not Just Use CLIPLoaderGGUF?
+| Node | Description |
+|------|-------------|
+| **LUNA VLM Loader** | Load a GGUF model (+ optional mmproj for vision) via llama-cpp-python |
+| **LUNA Text Conditioner** | Extract penultimate hidden states for Z-Image conditioning, with optional adapter alignment |
+| **LUNA VLM Chat** | Feed an image to the VLM, get descriptive text back for prompt engineering |
 
-**You can.** For most users, `CLIPLoaderGGUF` → `Qwen3-4B.i1-Q4_K_M.gguf` → type `lumina2` → `CLIPTextEncode` works perfectly.
+## Installation
 
-These nodes add value in two cases:
-1. **Adapter alignment** — If you're using an instruct, VL, or abliterated model variant instead of the base Qwen3-4B, the weight distribution has drifted. The built-in adapter realigns the hidden states to match what Z-Image's denoiser expects.
-2. **VLM inference** — Use the same GGUF model (with mmproj) to *look at* images and generate text descriptions, which you can then feed into conditioning.
+### Via ComfyUI Manager (Recommended)
+Search for **LUNA Z-Image Qwen3-VL** in ComfyUI Manager and install.
 
-### VRAM Savings
-
-| Encoder | Size | VRAM |
-|---------|------|------|
-| Qwen3-4B safetensors (bf16) | 7.67 GB | ~8.2 GB |
-| Qwen3-4B GGUF (Q4_K_M) | 2.4 GB | ~2.5 GB |
-| Qwen3-VL-4B GGUF + adapter | 2.4 GB + 160 MB | ~2.7 GB |
-
-## Requirements
-
-**llama-cpp-python** with penultimate layer support. Install the pre-built wheel:
-
-### Windows (CUDA)
+### Manual
 ```bash
-pip install llama-cpp-python --extra-index-url https://github.com/JamePeng/llama-cpp-python-luna/releases/latest
+cd ComfyUI/custom_nodes
+git clone https://github.com/LSDJesus/LUNA-Z-Image-Qwen3-VL.git
+cd LUNA-Z-Image-Qwen3-VL
+pip install -r requirements.txt
 ```
 
-### Linux (CUDA)
-```bash
-pip install llama-cpp-python --extra-index-url https://github.com/JamePeng/llama-cpp-python-luna/releases/latest
-```
+## Dependencies
 
-### From Source (Advanced)
-```bash
-# Requires CUDA Toolkit + Visual Studio Build Tools (Windows) or gcc (Linux)
-CMAKE_ARGS="-DGGML_CUDA=ON" pip install llama-cpp-python --no-binary llama-cpp-python
-```
+This node requires a custom fork of **llama-cpp-python** with penultimate hidden state extraction support. The correct wheel is installed automatically via `requirements.txt`:
+
+- **Windows (CUDA):** [llama_cpp_python-0.3.27 (win_amd64)](https://github.com/LSDJesus/llama-cpp-python/releases/download/v0.3.27-cuda-6396cf3/llama_cpp_python-0.3.27-cp39-abi3-win_amd64.whl)
+- **Linux (CUDA):** [llama_cpp_python-0.3.27 (manylinux)](https://github.com/LSDJesus/llama-cpp-python/releases/download/v0.3.27-cuda-6396cf3/llama_cpp_python-0.3.27-cp39-abi3-manylinux_2_28_x86_64.whl)
 
 ## Models
 
-| File | Purpose | Where to Put It |
-|------|---------|-----------------|
-| `Qwen3-4B.i1-Q4_K_M.gguf` | Text encoder (base) | `ComfyUI/models/text_encoders/` |
-| `Qwen3-VL-4B-*.gguf` | Text encoder (VL variant) | `ComfyUI/models/text_encoders/` |
-| `*.mmproj-Q8_0.gguf` | Vision projector (for VLM Chat) | `ComfyUI/models/text_encoders/` |
-| `vl_to_base_adapter_best.safetensors` | Adapter (for VL variants) | `ComfyUI/models/text_encoders/` |
+All model files are stored in `ComfyUI/models/LLM/LUNA-Qwen3-VL/` and **downloaded automatically** from [HuggingFace](https://huggingface.co/LSDJesus/LUNA-Qwen3-VL) when you first run a node.
+
+| File | Size | Purpose |
+|------|------|---------|
+| `LUNA-Qwen3-VL.i1-Q4_K_M.gguf` | ~2.4 GB | GGUF text encoder model |
+| `LUNA-Qwen3-VL.mmproj-Q8_0.gguf` | ~600 MB | Vision projector (needed for VLM Chat) |
+| `LUNA-Qwen3-VL_adapter.safetensors` | ~160 MB | VL-to-Base adapter for conditioning alignment |
+
+To download manually instead, place the files in `ComfyUI/models/LLM/LUNA-Qwen3-VL/`.
+
+### Why an Adapter?
+
+The VL/Instruct variants of Qwen3 have drifted from the base model's hidden state distribution. The adapter realigns the penultimate layer outputs to match what Z-Image's denoiser expects, so you get proper conditioning from a vision-capable model.
+
+### VRAM Usage
+
+| Configuration | Size on Disk | VRAM |
+|---------------|-------------|------|
+| Qwen3-4B safetensors (bf16) | 7.67 GB | ~8.2 GB |
+| LUNA-Qwen3-VL GGUF (Q4_K_M) | 2.4 GB | ~2.5 GB |
+| LUNA-Qwen3-VL GGUF + adapter | 2.4 GB + 160 MB | ~2.7 GB |
 
 ## Workflow Examples
 
-### Basic Text Encoding (GGUF replaces safetensors)
+### Text Encoding with Adapter
 ```
 [LUNA VLM Loader] → [LUNA Text Conditioner] → CONDITIONING → [KSampler]
-  ├─ model: Qwen3-4B.i1-Q4_K_M.gguf
-  └─ adapter: none (not needed for base model)
-```
-
-### VL Variant with Adapter
-```
-[LUNA VLM Loader] → [LUNA Text Conditioner] → CONDITIONING → [KSampler]
-  ├─ model: Qwen3-VL-4B-abliterated-Q4_K_M.gguf
-  └─ adapter: vl_to_base_adapter_best.safetensors
+  ├─ model:   LUNA-Qwen3-VL.i1-Q4_K_M.gguf
+  └─ adapter: LUNA-Qwen3-VL_adapter.safetensors
 ```
 
 ### VLM Image Description → Conditioning
 ```
 [Load Image] ──────────────┐
                             ▼
-[LUNA VLM Loader] → [LUNA VLM Chat] → TEXT ─┐
-  ├─ model: Qwen3-VL-4B-*.gguf              │
-  └─ mmproj: *.mmproj-Q8_0.gguf             ▼
-                              [String Concatenate] → [CLIPTextEncode / LUNA Text Conditioner] → CONDITIONING
-                                      ▲
-                    [manual prompt] ───┘
+[LUNA VLM Loader] → [LUNA VLM Chat] → TEXT → [LUNA Text Conditioner] → CONDITIONING
+  ├─ model:   LUNA-Qwen3-VL.i1-Q4_K_M.gguf
+  ├─ mmproj:  LUNA-Qwen3-VL.mmproj-Q8_0.gguf
+  └─ adapter: LUNA-Qwen3-VL_adapter.safetensors
 ```
+
+### VLM Chat + Manual Prompt Combination
+```
+[Load Image] ──────────────┐
+                            ▼
+[LUNA VLM Loader] → [LUNA VLM Chat] → TEXT ─┐
+  ├─ model:   LUNA-Qwen3-VL.i1-Q4_K_M.gguf  │
+  └─ mmproj:  LUNA-Qwen3-VL.mmproj-Q8_0.gguf ▼
+                               [String Concatenate] → [LUNA Text Conditioner] → CONDITIONING
+                                       ▲
+                     [manual prompt] ───┘
+```
+
+## Credits
+
+- **llama-cpp-python** fork with penultimate layer API: [LSDJesus/llama-cpp-python](https://github.com/LSDJesus/llama-cpp-python)
+- Based on work from [JamePeng/llama-cpp-python](https://github.com/JamePeng/llama-cpp-python)
 
 ## License
 
