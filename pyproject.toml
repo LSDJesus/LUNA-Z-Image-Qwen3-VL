@@ -1,7 +1,7 @@
 [project]
 name = "luna-z-image-qwen3-vl"
 description = "ComfyUI nodes for GGUF-based Qwen3/Qwen3-VL text encoding and VLM inference for Z-Image"
-version = "0.1.0"
+version = "0.1.1"
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.9"

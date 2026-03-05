@@ -105,9 +105,8 @@ class LunaVLMChat:
         mtmd_params.verbosity = 0
 
         mtmd_ctx = mtmd_cpp.mtmd_init_from_file(
-            llm._model.model,
-            llm._ctx.ctx,
             mmproj_path.encode("utf-8"),
+            llm._model.model,
             mtmd_params,
         )
         if mtmd_ctx is None:

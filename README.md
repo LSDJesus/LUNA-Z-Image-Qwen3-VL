@@ -4,6 +4,8 @@ ComfyUI custom nodes for using **GGUF quantized Qwen3-VL** as a text encoder for
 
 **Models are auto-downloaded from [HuggingFace](https://huggingface.co/LSDJesus/LUNA-Qwen3-VL) on first use.**
 
+> **[How We Got Here](Hacking_llama_for_qwen3-vl.md)** — Technical deep-dive into hacking llama.cpp for penultimate hidden state extraction, building the VL-to-Base adapter, and achieving 3.3× VRAM reduction with vision capabilities.
+
 ## Nodes
 
 | Node | Description |
