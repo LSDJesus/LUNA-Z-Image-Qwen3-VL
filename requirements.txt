@@ -1,3 +1,5 @@
 huggingface_hub
+# LUNA fork of llama-cpp-python with penultimate hidden state extraction support.
+# Standard/official llama-cpp-python will NOT work for text conditioning.
 llama-cpp-python @ https://github.com/LSDJesus/llama-cpp-python/releases/download/v0.3.27-cuda-6396cf3/llama_cpp_python-0.3.27-cp39-abi3-win_amd64.whl ; sys_platform == "win32"
 llama-cpp-python @ https://github.com/LSDJesus/llama-cpp-python/releases/download/v0.3.27-cuda-6396cf3/llama_cpp_python-0.3.27-cp39-abi3-manylinux_2_28_x86_64.whl ; sys_platform == "linux"

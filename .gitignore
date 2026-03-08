@@ -4,7 +4,10 @@ __pycache__/
 *$py.class
 .codebase/
 adapter/
-
+scripts/
+docs/
+adapter_*/
+driftsnap_lora*/
 # C extensions
 *.so
 

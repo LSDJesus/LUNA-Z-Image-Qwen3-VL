@@ -1,98 +1,48 @@
 """
 LunaTextConditioner — Extract penultimate hidden states from a GGUF LLM
-for Z-Image conditioning, with optional VL-to-Base adapter alignment.
+for Z-Image conditioning, with automatic VL-to-Base adapter alignment.
 
 Takes text input, runs it through the loaded GGUF model via llama-cpp-python,
-extracts hidden_states[-2] (penultimate layer), optionally applies an adapter
-to align variant models to the base distribution, and outputs standard
-ComfyUI CONDITIONING format compatible with Z-Image / Lumina2.
+extracts hidden_states[-2] (penultimate layer), automatically applies the
+matched adapter (loaded by the VLM Loader), and outputs standard ComfyUI
+CONDITIONING format compatible with Z-Image / Lumina2.
 """
 from __future__ import annotations
 
 import os
+import sys
 import logging
 import ctypes
+import contextlib
 
 import torch
-import torch.nn as nn
 import numpy as np
-
-from .nodes_loader import _get_adapter_files, _ensure_file
 
 logger = logging.getLogger("LUNA-VLM")
 
-# ── Adapter Architecture ─────────────────────────────────────────────────────
 
-class ResidualBlock(nn.Module):
-    """Single residual MLP block: x + MLP(norm(x))."""
-
-    def __init__(self, dim: int, hidden: int, dropout: float = 0.05):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, dim),
-            nn.Dropout(dropout),
-        )
-        # Init output projection near zero → starts as identity
-        nn.init.zeros_(self.mlp[3].weight)
-        nn.init.zeros_(self.mlp[3].bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.mlp(self.norm(x))
-
-
-class VLtoBaseAdapter(nn.Module):
-    """Maps VL/Instruct hidden states to Base hidden state space."""
-
-    def __init__(self, dim: int = 2560, hidden: int = 4096, n_blocks: int = 2):
-        super().__init__()
-        self.blocks = nn.ModuleList([
-            ResidualBlock(dim, hidden) for _ in range(n_blocks)
-        ])
-        self.final_norm = nn.LayerNorm(dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for block in self.blocks:
-            x = block(x)
-        return self.final_norm(x)
-
-
-# ── Adapter Cache ─────────────────────────────────────────────────────────────
-
-_adapter_cache: dict[str, VLtoBaseAdapter] = {}
-
-
-def _load_adapter(adapter_path: str, device: torch.device) -> VLtoBaseAdapter:
-    """Load adapter weights from .safetensors or .pt checkpoint."""
-    if adapter_path in _adapter_cache:
-        return _adapter_cache[adapter_path]
-
-    if adapter_path.endswith(".safetensors"):
-        from safetensors.torch import load_file
-        state_dict = load_file(adapter_path)
-        config = {"dim": 2560, "hidden": 4096, "n_blocks": 2}  # default
-    elif adapter_path.endswith(".pt"):
-        ckpt = torch.load(adapter_path, map_location="cpu", weights_only=False)
-        state_dict = ckpt.get("model_state_dict", ckpt)
-        config = ckpt.get("config", {"dim": 2560, "hidden": 4096, "n_blocks": 2})
-    else:
-        raise ValueError(f"Unsupported adapter format: {adapter_path}")
-
-    adapter = VLtoBaseAdapter(
-        dim=config.get("dim", 2560),
-        hidden=config.get("hidden", 4096),
-        n_blocks=config.get("n_blocks", 2),
-    )
-    adapter.load_state_dict(state_dict)
-    adapter = adapter.to(device).eval()
-
-    _adapter_cache[adapter_path] = adapter
-    logger.info(f"Loaded adapter: {os.path.basename(adapter_path)} "
-                f"({sum(p.numel() for p in adapter.parameters()):,} params)")
-    return adapter
+@contextlib.contextmanager
+def _suppress_c_output():
+    """Suppress C-level stdout/stderr (llama.cpp decode spam)."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    stdout_fd = sys.stdout.fileno()
+    stderr_fd = sys.stderr.fileno()
+    saved_stdout = os.dup(stdout_fd)
+    saved_stderr = os.dup(stderr_fd)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, stdout_fd)
+    os.dup2(devnull, stderr_fd)
+    os.close(devnull)
+    try:
+        yield
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(saved_stdout, stdout_fd)
+        os.dup2(saved_stderr, stderr_fd)
+        os.close(saved_stdout)
+        os.close(saved_stderr)
 
 
 # ── Node ──────────────────────────────────────────────────────────────────────
@@ -101,8 +51,8 @@ class LunaTextConditioner:
     """Extract penultimate layer hidden states from a GGUF LLM for Z-Image.
 
     Wraps text in the Qwen3 chat template, runs a forward pass through
-    llama-cpp-python, extracts per-token hidden_states[-2], optionally
-    applies a VL-to-Base adapter, and outputs CONDITIONING.
+    llama-cpp-python, extracts per-token hidden_states[-2], automatically
+    applies the matched adapter (from the loader), and outputs CONDITIONING.
     """
 
     CHAT_TEMPLATE = "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
@@ -115,12 +65,6 @@ class LunaTextConditioner:
                 "text": ("STRING", {"multiline": True, "dynamicPrompts": True,
                                     "tooltip": "Text prompt to encode"}),
             },
-            "optional": {
-                "adapter_path": (_get_adapter_files(),
-                                 {"tooltip": "Optional VL-to-Base alignment adapter. "
-                                  "Required for instruct/VL/abliterated model variants. "
-                                  "Not needed for base Qwen3-4B GGUF."}),
-            },
         }
 
     RETURN_TYPES = ("CONDITIONING",)
@@ -129,8 +73,7 @@ class LunaTextConditioner:
     CATEGORY = "LUNA/VLM"
     TITLE = "LUNA Text Conditioner"
 
-    def encode(self, llm_model: dict, text: str,
-               adapter_path: str = "none"):
+    def encode(self, llm_model: dict, text: str):
         import llama_cpp
 
         llm = llm_model["llm"]
@@ -163,7 +106,8 @@ class LunaTextConditioner:
                 batch.logits[i] = 1  # Mark ALL positions as output
             batch.n_tokens = n_tokens
 
-            ret = llama_cpp.llama_decode(llm._ctx.ctx, batch)
+            with _suppress_c_output():
+                ret = llama_cpp.llama_decode(llm._ctx.ctx, batch)
             if ret != 0:
                 raise RuntimeError(f"llama_decode failed with code {ret}")
         finally:
@@ -190,17 +134,13 @@ class LunaTextConditioner:
         cond_np = np.stack(embeddings, axis=0)
         cond = torch.from_numpy(cond_np).unsqueeze(0)  # [1, n_tokens, n_embd]
 
-        # ── Apply adapter if requested ────────────────────────────────
-        if adapter_path and adapter_path != "none":
-            full_adapter_path = _ensure_file(adapter_path)
-
+        # ── Apply adapter if loaded by the VLM Loader ────────────────
+        adapter = llm_model.get("adapter")
+        if adapter is not None:
             device = torch.device(f"cuda:{llm_model['gpu_index']}")
-            adapter = _load_adapter(full_adapter_path, device)
-
             with torch.no_grad():
                 cond = adapter(cond.to(device)).cpu()
-
-            logger.info(f"Applied adapter: {os.path.basename(adapter_path)}")
+            logger.info(f"Applied adapter: {llm_model.get('adapter_name', 'unknown')}")
 
         # ── Build CONDITIONING output ─────────────────────────────────
         # Z-Image / Lumina2 conditioning format:

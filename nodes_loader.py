@@ -12,8 +12,10 @@ consumed by LunaTextConditioner and LunaVLMChat nodes.
 from __future__ import annotations
 
 import os
+import re
 import logging
 import folder_paths
+import torch
 
 logger = logging.getLogger("LUNA-VLM")
 
@@ -24,7 +26,7 @@ HF_REPO_ID = "LSDJesus/LUNA-Qwen3-VL"
 # Known model files — always shown in dropdowns, auto-downloaded on first use
 DEFAULT_MODEL = "LUNA-Qwen3-VL.i1-Q4_K_M.gguf"
 DEFAULT_MMPROJ = "LUNA-Qwen3-VL.mmproj-Q8_0.gguf"
-DEFAULT_ADAPTER = "LUNA-Qwen3-VL_adapter.safetensors"
+DEFAULT_ADAPTER = "LUNA-Qwen3-VL_Q4_K_M_adapter.safetensors"
 
 # ── Register folder path ─────────────────────────────────────────────────────
 
@@ -121,6 +123,114 @@ def _get_adapter_files() -> list[str]:
     return result
 
 
+# ── Adapter Architecture ─────────────────────────────────────────────────────
+
+import torch.nn as nn
+
+
+class ResidualBlock(nn.Module):
+    """Single residual MLP block: x + MLP(norm(x))."""
+
+    def __init__(self, dim: int, hidden: int, dropout: float = 0.05):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, dim),
+            nn.Dropout(dropout),
+        )
+        nn.init.zeros_(self.mlp[3].weight)
+        nn.init.zeros_(self.mlp[3].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.mlp(self.norm(x))
+
+
+class VLtoBaseAdapter(nn.Module):
+    """Maps VL/Instruct hidden states to Base hidden state space."""
+
+    def __init__(self, dim: int = 2560, hidden: int = 4096, n_blocks: int = 2):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            ResidualBlock(dim, hidden) for _ in range(n_blocks)
+        ])
+        self.final_norm = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+        return self.final_norm(x)
+
+
+_adapter_cache: dict[str, VLtoBaseAdapter] = {}
+
+
+def _load_adapter(adapter_path: str, device: torch.device) -> VLtoBaseAdapter:
+    """Load adapter weights from .safetensors or .pt checkpoint."""
+    if adapter_path in _adapter_cache:
+        return _adapter_cache[adapter_path]
+
+    if adapter_path.endswith(".safetensors"):
+        from safetensors.torch import load_file
+        state_dict = load_file(adapter_path)
+        config = {"dim": 2560, "hidden": 4096, "n_blocks": 2}
+    elif adapter_path.endswith(".pt"):
+        ckpt = torch.load(adapter_path, map_location="cpu", weights_only=False)
+        state_dict = ckpt.get("model_state_dict", ckpt)
+        config = ckpt.get("config", {"dim": 2560, "hidden": 4096, "n_blocks": 2})
+    else:
+        raise ValueError(f"Unsupported adapter format: {adapter_path}")
+
+    adapter = VLtoBaseAdapter(
+        dim=config.get("dim", 2560),
+        hidden=config.get("hidden", 4096),
+        n_blocks=config.get("n_blocks", 2),
+    )
+    adapter.load_state_dict(state_dict)
+    adapter = adapter.to(device).eval()
+
+    _adapter_cache[adapter_path] = adapter
+    logger.info(f"Loaded adapter: {os.path.basename(adapter_path)} "
+                f"({sum(p.numel() for p in adapter.parameters()):,} params)")
+    return adapter
+
+
+def _extract_quant_tag(model_filename: str) -> str | None:
+    """Extract the quantization tag from a GGUF model filename.
+
+    Examples:
+        'LUNA-Qwen3-VL.i1-Q4_K_M.gguf' -> 'Q4_K_M'
+        'LUNA-Qwen3-VL.i1-IQ2_XXS.gguf' -> 'IQ2_XXS'
+    """
+    m = re.search(r'[.-]((?:I?Q[\d]+[A-Za-z_]*))\.gguf$', model_filename, re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+def _find_adapter_for_model(model_filename: str) -> str | None:
+    """Find the adapter file that matches a given GGUF model's quant tag.
+
+    Returns the adapter filename (not full path), or None if no match.
+    """
+    tag = _extract_quant_tag(model_filename)
+    if not tag:
+        return None
+
+    # Expected adapter filename pattern: LUNA-Qwen3-VL_{TAG}_adapter.safetensors
+    expected = f"LUNA-Qwen3-VL_{tag}_adapter.safetensors"
+
+    # Check if it exists locally or is known to be downloadable
+    all_adapters = _get_luna_files({".safetensors", ".pt"})
+    for f in all_adapters:
+        if f.lower() == expected.lower():
+            return f
+
+    # Not found locally, but it might be downloadable — return expected name
+    # (_ensure_file will attempt HF download)
+    return expected
+
+
 class LunaVLMLoader:
     """Load a GGUF language model via llama-cpp-python with optional mmproj.
 
@@ -174,6 +284,23 @@ class LunaVLMLoader:
         if mmproj_path and mmproj_path != "none":
             full_mmproj_path = _ensure_file(mmproj_path)
 
+        # ── Auto-detect and load matching adapter ─────────────────────
+        adapter = None
+        adapter_name = None
+        adapter_filename = _find_adapter_for_model(model_path)
+        if adapter_filename:
+            try:
+                full_adapter_path = _ensure_file(adapter_filename)
+                device = torch.device(f"cuda:{gpu_index}")
+                adapter = _load_adapter(full_adapter_path, device)
+                adapter_name = adapter_filename
+                logger.info(f"  adapter: {adapter_filename} (auto-detected)")
+            except Exception as e:
+                logger.warning(f"  Could not load adapter {adapter_filename}: {e}")
+                logger.warning(f"  Conditioning will work without adapter but quality may differ.")
+        else:
+            logger.info(f"  No matching adapter found for {model_path} — running without adapter")
+
         logger.info(f"Loading GGUF model: {model_path} on cuda:{gpu_index}")
         if full_mmproj_path:
             logger.info(f"  mmproj: {mmproj_path}")
@@ -207,6 +334,8 @@ class LunaVLMLoader:
             "n_embd": n_embd,
             "gpu_index": gpu_index,
             "has_mmproj": full_mmproj_path is not None,
+            "adapter": adapter,
+            "adapter_name": adapter_name,
         }
 
         return (result,)

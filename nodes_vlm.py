@@ -12,14 +12,40 @@ from __future__ import annotations
 
 import io
 import os
+import sys
 import ctypes
 import logging
+import contextlib
 
 import numpy as np
 import torch
 from PIL import Image
 
 logger = logging.getLogger("LUNA-VLM")
+
+
+@contextlib.contextmanager
+def _suppress_c_output():
+    """Suppress C-level stdout/stderr (llama.cpp tensor loading spam)."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    stdout_fd = sys.stdout.fileno()
+    stderr_fd = sys.stderr.fileno()
+    saved_stdout = os.dup(stdout_fd)
+    saved_stderr = os.dup(stderr_fd)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, stdout_fd)
+    os.dup2(devnull, stderr_fd)
+    os.close(devnull)
+    try:
+        yield
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(saved_stdout, stdout_fd)
+        os.dup2(saved_stderr, stderr_fd)
+        os.close(saved_stdout)
+        os.close(saved_stderr)
 
 
 def _tensor_to_pil(image_tensor: torch.Tensor) -> Image.Image:
@@ -60,6 +86,8 @@ class LunaVLMChat:
                                        "tooltip": "Maximum tokens to generate"}),
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.05,
                                           "tooltip": "Sampling temperature (0 = greedy)"}),
+                "repetition_penalty": ("FLOAT", {"default": 1.15, "min": 1.0, "max": 2.0, "step": 0.05,
+                                                    "tooltip": "Penalizes repeated tokens (1.0 = off, 1.1-1.3 recommended)"}),
                 "prepend_text": ("STRING", {
                     "multiline": True,
                     "default": "",
@@ -82,8 +110,8 @@ class LunaVLMChat:
 
     def chat(self, llm_model: dict, image: torch.Tensor, prompt: str,
              system_prompt: str = "", max_tokens: int = 256,
-             temperature: float = 0.7, prepend_text: str = "",
-             append_text: str = ""):
+             temperature: float = 0.7, repetition_penalty: float = 1.15,
+             prepend_text: str = "", append_text: str = ""):
 
         if not llm_model.get("has_mmproj"):
             raise RuntimeError(
@@ -104,11 +132,12 @@ class LunaVLMChat:
         mtmd_params.n_threads = max(1, os.cpu_count() // 2)
         mtmd_params.verbosity = 0
 
-        mtmd_ctx = mtmd_cpp.mtmd_init_from_file(
-            mmproj_path.encode("utf-8"),
-            llm._model.model,
-            mtmd_params,
-        )
+        with _suppress_c_output():
+            mtmd_ctx = mtmd_cpp.mtmd_init_from_file(
+                mmproj_path.encode("utf-8"),
+                llm._model.model,
+                mtmd_params,
+            )
         if mtmd_ctx is None:
             raise RuntimeError(f"Failed to initialize mtmd context from {mmproj_path}")
 
@@ -120,8 +149,10 @@ class LunaVLMChat:
             img_bytes = img_buffer.getvalue()
 
             # ── Create bitmap from image bytes ────────────────────────
-            bitmap = mtmd_cpp.mtmd_bitmap_init_from_memory(
-                img_bytes, len(img_bytes)
+            buf_type = ctypes.c_uint8 * len(img_bytes)
+            buf = buf_type.from_buffer_copy(img_bytes)
+            bitmap = mtmd_cpp.mtmd_helper_bitmap_init_from_buf(
+                mtmd_ctx, buf, ctypes.c_size_t(len(img_bytes))
             )
             if bitmap is None:
                 raise RuntimeError("Failed to create mtmd bitmap from image")
@@ -129,6 +160,7 @@ class LunaVLMChat:
             try:
                 # ── Build chat prompt with image marker ───────────────
                 media_marker = mtmd_cpp.mtmd_default_marker().decode("utf-8")
+                logger.debug(f"  Media marker: {repr(media_marker)}")
 
                 if system_prompt:
                     chat_text = (
@@ -154,11 +186,12 @@ class LunaVLMChat:
                     raise RuntimeError("Failed to create mtmd input chunks")
 
                 try:
-                    ret = mtmd_cpp.mtmd_tokenize(
-                        mtmd_ctx, chunks,
-                        ctypes.byref(input_text),
-                        bitmap_array, 1,
-                    )
+                    with _suppress_c_output():
+                        ret = mtmd_cpp.mtmd_tokenize(
+                            mtmd_ctx, chunks,
+                            ctypes.byref(input_text),
+                            bitmap_array, 1,
+                        )
                     if ret != 0:
                         raise RuntimeError(f"mtmd_tokenize failed: {ret}")
 
@@ -166,7 +199,9 @@ class LunaVLMChat:
                     llm.reset()
                     llm._ctx.memory_clear(True)
                     n_past = 0
+                    last_chunk_n_tokens = 1  # fallback
                     n_chunks = mtmd_cpp.mtmd_input_chunks_size(chunks)
+                    logger.debug(f"  Processing {n_chunks} chunks")
 
                     for i in range(n_chunks):
                         chunk = mtmd_cpp.mtmd_input_chunks_get(chunks, i)
@@ -181,55 +216,81 @@ class LunaVLMChat:
                                 chunk, ctypes.byref(n_tok_out)
                             )
                             if tok_ptr and n_tok_out.value > 0:
-                                tokens = [tok_ptr[j] for j in range(n_tok_out.value)]
-                                batch = llama_cpp.llama_batch_init(len(tokens), 0, 1)
+                                n_tok = n_tok_out.value
+                                tokens = [tok_ptr[j] for j in range(n_tok)]
+                                logger.debug(f"    Chunk {i}: TEXT, {n_tok} tokens, pos {n_past}-{n_past + n_tok - 1}")
+                                batch = llama_cpp.llama_batch_init(n_tok, 0, 1)
                                 for k, tok in enumerate(tokens):
                                     batch.token[k] = tok
                                     batch.pos[k] = n_past + k
                                     batch.n_seq_id[k] = 1
                                     batch.seq_id[k][0] = 0
-                                    batch.logits[k] = 1 if k == len(tokens) - 1 else 0
-                                batch.n_tokens = len(tokens)
+                                    batch.logits[k] = 1 if k == n_tok - 1 else 0
+                                batch.n_tokens = n_tok
 
-                                ret = llama_cpp.llama_decode(llm._ctx.ctx, batch)
+                                with _suppress_c_output():
+                                    ret = llama_cpp.llama_decode(llm._ctx.ctx, batch)
                                 llama_cpp.llama_batch_free(batch)
                                 if ret != 0:
                                     raise RuntimeError(f"llama_decode failed: {ret}")
-                                n_past += len(tokens)
+                                n_past += n_tok
+                                last_chunk_n_tokens = n_tok
 
                         else:  # IMAGE or AUDIO chunk
                             new_n_past = llama_cpp.llama_pos(0)
-                            ret = mtmd_cpp.mtmd_helper_eval_chunk_single(
-                                mtmd_ctx, llm._ctx.ctx, chunk,
-                                llama_cpp.llama_pos(n_past),
-                                llama_cpp.llama_seq_id(0),
-                                llm.n_batch,
-                                True,  # logits_last
-                                ctypes.byref(new_n_past),
-                            )
+                            with _suppress_c_output():
+                                ret = mtmd_cpp.mtmd_helper_eval_chunk_single(
+                                    mtmd_ctx, llm._ctx.ctx, chunk,
+                                    llama_cpp.llama_pos(n_past),
+                                    llama_cpp.llama_seq_id(0),
+                                    llm.n_batch,
+                                    True,  # logits_last
+                                    ctypes.byref(new_n_past),
+                                )
                             if ret != 0:
                                 raise RuntimeError(f"mtmd_helper_eval_chunk_single failed: {ret}")
+                            n_img_tokens = new_n_past.value - n_past
+                            logger.debug(f"    Chunk {i}: IMAGE, {n_img_tokens} tokens, pos {n_past}-{new_n_past.value - 1}")
                             n_past = new_n_past.value
 
-                    llm.n_tokens = n_past
+                    logger.debug(f"  Context filled: {n_past} tokens total")
 
                     # ── Generate text tokens ──────────────────────────
+                    # The embeddings=True flag causes llama.cpp to override
+                    # our logits flags and mark ALL tokens as outputs. This
+                    # means llama_get_logits() returns logits for token 0 of
+                    # the last batch, not the last token. We must use
+                    # llama_get_logits_ith() to get the correct position.
                     output_tokens = []
                     eos_token = llm.token_eos()
 
+                    # After chunk processing, we need logits from the last
+                    # decoded batch. Track the index of the last token.
+                    last_batch_size = last_chunk_n_tokens
+                    logits_idx = last_batch_size - 1
+
                     for _ in range(max_tokens):
-                        logits_ptr = llm._ctx.get_logits()
+                        logits_ptr = llama_cpp.llama_get_logits_ith(
+                            llm._ctx.ctx, ctypes.c_int32(logits_idx)
+                        )
                         logits = np.ctypeslib.as_array(
                             logits_ptr, shape=(llm._n_vocab,)
                         ).copy()
 
+                        # Apply repetition penalty to previously generated tokens
+                        if repetition_penalty > 1.0 and output_tokens:
+                            seen = set(output_tokens)
+                            for tid in seen:
+                                if logits[tid] > 0:
+                                    logits[tid] /= repetition_penalty
+                                else:
+                                    logits[tid] *= repetition_penalty
+
                         if temperature <= 0.01:
-                            # Greedy
                             token = int(np.argmax(logits))
                         else:
-                            # Temperature sampling
                             logits = logits / temperature
-                            logits -= np.max(logits)  # numerical stability
+                            logits -= np.max(logits)
                             probs = np.exp(logits)
                             probs /= probs.sum()
                             token = int(np.random.choice(len(probs), p=probs))
@@ -238,7 +299,22 @@ class LunaVLMChat:
                             break
 
                         output_tokens.append(token)
-                        llm.eval([token])
+
+                        # Decode next token with manual batch
+                        batch = llama_cpp.llama_batch_init(1, 0, 1)
+                        batch.token[0] = token
+                        batch.pos[0] = n_past
+                        batch.n_seq_id[0] = 1
+                        batch.seq_id[0][0] = 0
+                        batch.logits[0] = 1
+                        batch.n_tokens = 1
+                        with _suppress_c_output():
+                            ret = llama_cpp.llama_decode(llm._ctx.ctx, batch)
+                        llama_cpp.llama_batch_free(batch)
+                        if ret != 0:
+                            logger.warning(f"  llama_decode failed at token {len(output_tokens)}")
+                        logits_idx = 0  # single-token batch, logits at index 0
+                        n_past += 1
 
                     generated_text = llm.detokenize(output_tokens).decode(
                         "utf-8", errors="replace"
