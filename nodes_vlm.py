@@ -120,7 +120,22 @@ class LunaVLMChat:
             )
 
         import llama_cpp
-        from llama_cpp import mtmd_cpp
+        try:
+            from llama_cpp import mtmd_cpp
+        except ImportError:
+            raise ImportError(
+                "LUNA-Z-Image-Qwen3-VL requires the LUNA fork of llama-cpp-python "
+                "(v0.3.27+) with mtmd support. The standard PyPI llama-cpp-python "
+                "will not work. See the README for installation instructions."
+            )
+
+        # Verify the mtmd API we need exists (catches old builds)
+        if not hasattr(mtmd_cpp, "mtmd_helper_bitmap_init_from_buf"):
+            raise ImportError(
+                f"Your llama-cpp-python (v{getattr(llama_cpp, '__version__', '?')}) "
+                "is missing mtmd_helper_bitmap_init_from_buf. Please install the "
+                "LUNA fork v0.3.27+ from the releases listed in requirements.txt."
+            )
 
         llm = llm_model["llm"]
         mmproj_path = llm_model["mmproj_path"]
